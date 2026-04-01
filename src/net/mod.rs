@@ -32,14 +32,14 @@ pub type NetworkReference =
 
 pub struct MqttStorage {
     telemetry: [u8; 2048],
-    settings: [u8; 1024],
+    settings: [u8; 2048],
 }
 
 impl Default for MqttStorage {
     fn default() -> Self {
         Self {
             telemetry: [0u8; 2048],
-            settings: [0u8; 1024],
+            settings: [0u8; 2048],
         }
     }
 }
@@ -214,7 +214,7 @@ where
         let mut settings_path: String<128> = String::new();
         match self.miniconf.handled_update(|path, old, new| {
             settings_path = path.into();
-            *old = new.clone();
+                        *old = new.clone();
             Result::<(), &'static str>::Ok(())
         }) {
             Ok(true) => NetworkState::SettingsChanged(settings_path),
