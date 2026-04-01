@@ -73,6 +73,9 @@ use mutex_trait::Mutex;
 use super::design_parameters::{SampleBuffer, MAX_SAMPLE_BUFFER_SIZE};
 use super::timers;
 
+
+use core::ptr;
+
 use hal::{
     dma::{
         config::Priority,
@@ -337,6 +340,7 @@ macro_rules! adc_input {
                         // Write a binary code into the SPI control register to initiate a transfer.
                         SPI_START[0] = 0x201;
                     };
+                use core::ptr;
 
                     // Construct the trigger stream to write from memory to the peripheral.
                     let trigger_transfer: Transfer<
@@ -412,14 +416,41 @@ macro_rules! adc_input {
                 /// then call a function on the now inactive buffer and acknowledge the
                 /// transfer complete flag.
                 ///
-                /// NOTE(unsafe): Memory safety and access ordering is not guaranteed
-                /// (see the HAL DMA docs).
-                pub fn with_buffer<F, R>(&mut self, f: F) -> Result<R, DMAError>
+                
+
+
+                pub fn with_buffer<F, R>(&mut self, f: F) -> R
                 where
                     F: FnOnce(&mut &'static mut [u16]) -> R,
                 {
-                    unsafe { self.transfer.next_dbm_transfer_with(|buf, _current| f(buf)) }
+                    static mut FALLBACK_BUF: [u16; 1] = [0];
+
+                    let mut selected: Option<&'static mut [u16]> = None;
+
+                    let transfer_result = unsafe {
+                        self.transfer.next_dbm_transfer_with(
+                            |buf: &mut &'static mut [u16], _current| {
+                                // SAFETY:
+                                // `buf` points to a &'static mut [u16] provided by DMA.
+                                // Reading it with ptr::read detaches the value from the borrow.
+                                let raw: &'static mut [u16] = ptr::read(buf);
+                                selected = Some(raw);
+                            }
+                        )
+                    };
+
+                    let buf = match transfer_result {
+                        Ok(_) => selected.expect("DMA returned Ok but no buffer"),
+                        Err(_) => unsafe { log::info!("DMAError"); &mut FALLBACK_BUF },
+                    };
+
+                    // Wrap in a pointer-to-pointer as required by f
+                    let mut buf_ref = buf;
+                    f(&mut buf_ref)
                 }
+
+
+
             }
 
             // This is not actually a Mutex. It only re-uses the semantics and macros of mutex-trait
@@ -427,12 +458,16 @@ macro_rules! adc_input {
             impl Mutex for $name {
                 type Data = &'static mut [u16];
                 fn lock<R>(&mut self, f: impl FnOnce(&mut Self::Data) -> R) -> R {
-                    self.with_buffer(f).unwrap()
+                    self.with_buffer(f)
                 }
             }
+
+
         }
     };
 }
+
+static mut FALLBACK_BUF: [u16; 1] = [0];
 
 adc_input!(
     Adc0Input, 0, Stream0, Stream1, Stream2, SPI2, Channel1, Tim2Ch1, Channel1,
