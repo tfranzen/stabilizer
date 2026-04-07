@@ -48,7 +48,7 @@ impl Settings {
         write!(&mut id, "{mac}").unwrap();
 
         Self {
-            broker: "10.255.6.4".into(),
+            broker: "192.168.1.171".into(),
             id,
             mac,
         }
@@ -97,7 +97,7 @@ pub struct SettingsItem {
 impl sequential_storage::map::StorageItem for SettingsItem {
     type Key = heapless::String<32>;
     type Error = postcard::Error;
-
+                
     fn serialize_into(&self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
         Ok(postcard::to_slice(self, buffer)?.len())
     }
