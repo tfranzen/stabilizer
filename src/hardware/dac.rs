@@ -272,7 +272,7 @@ macro_rules! dac_output {
 
                     let buf = match transfer_result {
                         Ok(_) => selected.expect("DMA returned Ok but no buffer"),
-                        Err(_) => unsafe { log::info!("DMAError"); &mut FALLBACK_BUF },
+                        Err(_) => unsafe { log::info!("DAC DMAError"); &mut FALLBACK_BUF },
                     };
 
                     // Wrap in a pointer-to-pointer as required by f

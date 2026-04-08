@@ -38,14 +38,14 @@ use mutex_trait::prelude::*;
 use idsp::iir;
 
 use stabilizer::{
+    app_utils::pdh::{Channel, PounderPdhSettings},
     hardware::{
         self,
         adc::{Adc0Input, Adc1Input, AdcCode},
         afe::Gain,
         dac::{Dac0Output, Dac1Output, DacCode},
         hal,
-        pounder::{ClockConfig, PounderConfig},
-        setup::PounderDevices as Pounder,
+        pounder::attenuators::AttenuatorInterface,
         signal_generator::{self, SignalGenerator},
         timers::SamplingTimer,
         DigitalInput0, DigitalInput1, SerialTerminal, SystemTimer, Systick,
@@ -155,9 +155,8 @@ pub struct Settings {
     ///
     /// # Value
     /// See [PounderConfig#miniconf]
-    /// TODO: this was #[miniconf(defer)] -- is this right? Also, miniconf::Option vs Option?
-    #[tree]
-    pounder: Option<PounderConfig>,
+    #[tree(depth(2))]
+    pounder: [PounderPdhSettings; 2],
 }
 
 impl Default for Settings {
@@ -186,13 +185,18 @@ impl Default for Settings {
 
             stream_target: StreamTarget::default(),
 
-            pounder: None.into(),
+            // Pounder config initialisation
+            pounder: [
+                PounderPdhSettings::new(Channel::ZERO),
+                PounderPdhSettings::new(Channel::ONE),
+            ],
         }
     }
 }
 
 #[rtic::app(device = stabilizer::hardware::hal::stm32, peripherals = true, dispatchers=[DCMI, JPEG, LTDC, SDMMC])]
 mod app {
+    use stabilizer::hardware::pounder;
     use super::*;
 
     #[monotonic(binds = SysTick, default = true, priority = 2)]
@@ -206,7 +210,8 @@ mod app {
         settings: Settings,
         telemetry: TelemetryBuffer,
         signal_generator: [SignalGenerator; 2],
-        pounder: Option<Pounder>,
+        pounder: pounder::PounderDevices,
+        dds: pounder::dds_output::DdsOutput,
     }
 
     #[local]
@@ -218,7 +223,6 @@ mod app {
         adcs: (Adc0Input, Adc1Input),
         dacs: (Dac0Output, Dac1Output),
         iir_state: [[[f32; 4]; IIR_CASCADE_LENGTH]; 2],
-        dds_clock_state: Option<ClockConfig>,
         generator: FrameGenerator,
         cpu_temp_sensor: stabilizer::hardware::cpu_temp_sensor::CpuTempSensor,
     }
@@ -237,15 +241,15 @@ mod app {
         );
 
         let device_settings = stabilizer.usb_serial.settings();
-        let mut application_settings = Settings::default();
-        if pounder.is_some() {
-            application_settings
-                .pounder
-                .replace(PounderConfig::default());
-        }
+        let application_settings = Settings::default();
 
-        let dds_clock_state = pounder.as_ref().map(|_| ClockConfig::default());
+        let mut pounder =
+            pounder.expect("PDH requires a Pounder");
 
+        application_settings.pounder.iter().for_each(|p| {
+            p.set_all_dds(&mut pounder)
+                .unwrap_or_else(|_| log::warn!("Failed to update Pounder DDS"));
+        });
         let mut network = NetworkUsers::new(
             stabilizer.net.stack,
             stabilizer.net.phy,
@@ -276,7 +280,8 @@ mod app {
                         .unwrap(),
                 ),
             ],
-            pounder,
+            dds: pounder.dds_output,
+            pounder: pounder.pounder,
         };
 
         let mut local = Local {
@@ -287,11 +292,12 @@ mod app {
             adcs: stabilizer.adcs,
             dacs: stabilizer.dacs,
             iir_state: [[[0.; 4]; IIR_CASCADE_LENGTH]; 2],
-            dds_clock_state,
+            //dds_clock_state,
             generator,
             cpu_temp_sensor: stabilizer.temperature_sensor,
         };
 
+        log::info!("Sample period {} us", SAMPLE_PERIOD*1e6);
         // Enable ADC/DAC events
         local.adcs.0.start();
         local.adcs.1.start();
@@ -330,12 +336,13 @@ mod app {
     ///
     /// Because the ADC and DAC operate at the same rate, these two constraints actually implement
     /// the same time bounds, meeting one also means the other is also met.
-    #[task(binds=DMA1_STR4, local=[digital_inputs, adcs, dacs, iir_state, generator], shared=[settings, signal_generator, telemetry], priority=3)]
+    #[task(binds=DMA1_STR4, local=[digital_inputs, adcs, dacs, iir_state, generator], shared=[settings, signal_generator, telemetry, dds], priority=3)]
     #[link_section = ".itcm.process"]
     fn process(c: process::Context) {
         let process::SharedResources {
             settings,
             telemetry,
+            dds: _,
             signal_generator,
         } = c.shared;
 
@@ -396,7 +403,7 @@ mod app {
                     }
 
                     // Stream the data.
-                    const N: usize = BATCH_SIZE * core::mem::size_of::<i16>();
+                    const N.1: usize = BATCH_SIZE * core::mem::size_of::<i16>();
                     generator.add(|buf| {
                         for (data, buf) in adc_samples
                             .iter()
@@ -452,8 +459,9 @@ mod app {
         }
     }
 
-    #[task(priority = 1, local=[afes, dds_clock_state], shared=[network, settings, signal_generator, pounder])]
+    #[task(priority = 1, local=[afes], shared=[network, settings, signal_generator, pounder, dds])]
     fn settings_update(mut c: settings_update::Context) {
+
         let settings = c.shared.network.lock(|net| *net.miniconf.settings());
         c.shared.settings.lock(|current| *current = settings);
 
@@ -477,23 +485,62 @@ mod app {
         }
 
         // Update Pounder configurations
-        c.shared.pounder.lock(|pounder| {
-            if let Some(pounder) = pounder {
-                let pounder_settings = settings.pounder.as_ref().unwrap();
-                // let mut clocking = c.local.dds_clock_state;
-                pounder.update_dds(
-                    *pounder_settings,
-                    &mut c.local.dds_clock_state,
-                );
-            }
-        });
+        // Update DDS outputs and waveforms.
+        // Testing shows that DDS and attenuation updates can be VERY slow. The duration
+        // of each lock below should be minimized to allow interruptions by the process
+        // task so as to avoid a DMA overflow.
+        for pounder_setting in settings.pounder.iter() {
+            // DDS update.
+            let (ftw_in, acr_in, pow_in, ftw_out, acr_out, pow_out) =
+                pounder_setting.get_dds_words().unwrap_or_else(|err| {
+                    log::warn!("Failed to update Pounder DDS: {:#?}", err);
+                    (0, 0, 0, 0,0,0)
+                });
+            let (in_ch, out_ch) = pounder_setting.channel.into();
 
+            c.shared.dds.lock(|dds| {
+                let mut dds_builder = dds.builder();
+                dds_builder.update_channels(
+                    in_ch.into(),
+                    Some(ftw_in),
+                    Some(pow_in),
+                    Some(acr_in),
+                );
+                dds_builder
+                    .update_channels(
+                        out_ch.into(),
+                        Some(ftw_out),
+                        Some(pow_out),
+                        Some(acr_out),
+                    )
+                    .write();
+            });
+
+            // Attenuation updates.
+            for (ch, attn) in [in_ch, out_ch].iter().zip(
+                [
+                    pounder_setting.attenuation_in,
+                    pounder_setting.attenuation_out,
+                ]
+                .iter(),
+            ) {
+                c.shared.pounder.lock(|pounder| {
+                    pounder.set_attenuation(*ch, *attn).unwrap_or_else(|_| {
+                        log::warn!("Failed to update Pounder attenuation");
+                        31.5
+                    });
+                });
+            }
+        }
+
+        
         let target = settings.stream_target.into();
         c.shared.network.lock(|net| net.direct_stream(target));
     }
 
     #[task(priority = 1, shared=[network, settings, telemetry, pounder], local=[cpu_temp_sensor])]
     fn telemetry(mut c: telemetry::Context) {
+
         let telemetry: TelemetryBuffer =
             c.shared.telemetry.lock(|telemetry| *telemetry);
 
@@ -502,7 +549,7 @@ mod app {
                 (
                     settings.afe,
                     settings.telemetry_period,
-                    pounder.as_mut().map(|pdr| pdr.get_telemetry()),
+                    pounder.get_telemetry(),
                 )
             });
 
@@ -511,13 +558,14 @@ mod app {
                 gains[0],
                 gains[1],
                 c.local.cpu_temp_sensor.get_temperature().unwrap(),
-                pounder_telemetry,
+                Some(pounder_telemetry),
             ))
         });
 
         // Schedule the telemetry task in the future.
         telemetry::Monotonic::spawn_after((telemetry_period as u64).secs())
             .unwrap();
+
     }
 
     #[task(priority = 1, shared=[usb], local=[usb_terminal])]

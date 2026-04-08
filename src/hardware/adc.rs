@@ -441,7 +441,7 @@ macro_rules! adc_input {
 
                     let buf = match transfer_result {
                         Ok(_) => selected.expect("DMA returned Ok but no buffer"),
-                        Err(_) => unsafe { log::info!("DMAError"); &mut FALLBACK_BUF },
+                        Err(_) => unsafe { log::info!("ADC DMAError"); &mut FALLBACK_BUF },
                     };
 
                     // Wrap in a pointer-to-pointer as required by f
