@@ -32,14 +32,14 @@ pub type NetworkReference =
 
 pub struct MqttStorage {
     telemetry: [u8; 2048],
-    settings: [u8; 2048],
+    settings: [u8; 4096],
 }
 
 impl Default for MqttStorage {
     fn default() -> Self {
         Self {
             telemetry: [0u8; 2048],
-            settings: [0u8; 2048],
+            settings: [0u8; 4096],
         }
     }
 }
