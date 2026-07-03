@@ -65,7 +65,7 @@ const SCALE: f32 = i16::MAX as _;
 const IIR_CASCADE_LENGTH: usize = 4;
 
 // The number of samples in each batch process
-const BATCH_SIZE: usize = 8;
+const BATCH_SIZE: usize = 2;
 
 // The logarithm of the number of 100MHz timer ticks between each sample. With a value of 2^7 =
 // 128, there is 1.28uS per sample, corresponding to a sampling frequency of 781.25 KHz.
@@ -87,6 +87,20 @@ pub struct Settings {
     /// Any of the variants of [Gain] enclosed in double quotes.
     #[tree]
     afe: [Gain; 2],
+
+
+
+    /// Configure input offsets.
+    ///
+    /// # Path
+    /// `input_offset/<n>`
+    ///
+    /// * `<n>` specifies which channel to configure. `<n>` := [0, 1]
+    ///
+    /// # Value
+    /// Any of the variants of [Gain] enclosed in double quotes.
+    #[tree]
+    input_offset: [f32; 2],
 
     /// Configure the IIR filter parameters.
     ///
@@ -167,6 +181,8 @@ impl Default for Settings {
         Self {
             // Analog frontend programmable gain amplifier gains (G1, G2, G5, G10)
             afe: [Gain::G1, Gain::G1],
+
+            input_offset: [0.,0.],
             // IIR filter tap gains are an array `[b0, b1, b2, a1, a2]` such that the
             // new output is computed as `y0 = a1*y1 + a2*y2 + b0*x0 + b1*x1 + b2*x2`.
             // The array is `iir_state[channel-index][cascade-index][coeff-index]`.
@@ -377,6 +393,7 @@ mod app {
                             .zip(&mut signal_generator[channel])
                             .map(|((ai, di), signal)| {
                                 let x = f32::from(*ai as i16);
+                                let x = x + settings.input_offset[channel] * (i16::MIN as f32 / -10.);
                                 let y = settings.iir_ch[channel]
                                     .iter()
                                     .zip(iir_state[channel].iter_mut())
