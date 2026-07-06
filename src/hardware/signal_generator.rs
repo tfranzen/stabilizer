@@ -150,6 +150,7 @@ pub struct SignalGenerator {
     phase_accumulator: i32,
     config: Config,
     rng: XorShiftRng,
+    pub hold: bool,
 }
 
 impl SignalGenerator {
@@ -165,6 +166,7 @@ impl SignalGenerator {
             config,
             phase_accumulator: 0,
             rng: XorShiftRng::from_seed([0; 16]), // zeros will initialize with XorShiftRng internal seed
+            hold: false,
         }
     }
 
@@ -177,6 +179,15 @@ impl SignalGenerator {
     pub fn clear_phase_accumulator(&mut self) {
         self.phase_accumulator = 0;
     }
+
+
+    pub fn sign(&mut self) -> bool{
+        self.phase_accumulator
+            .wrapping_add(self.config.phase_offset)
+            .is_negative()
+    }
+
+    
 }
 
 impl core::iter::Iterator for SignalGenerator {
@@ -188,9 +199,11 @@ impl core::iter::Iterator for SignalGenerator {
             .phase_accumulator
             .wrapping_add(self.config.phase_offset);
         let sign = phase.is_negative();
-        self.phase_accumulator = self
-            .phase_accumulator
-            .wrapping_add(self.config.phase_increment[sign as usize]);
+        if !self.hold {
+            self.phase_accumulator = self
+                .phase_accumulator
+                .wrapping_add(self.config.phase_increment[sign as usize]);
+        }
 
         let scale = match self.config.signal {
             Signal::Cosine => idsp::cossin(phase).0 >> 16,

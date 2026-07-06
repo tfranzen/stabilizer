@@ -39,6 +39,7 @@ use idsp::iir;
 
 use stabilizer::{
     app_utils::pdh::{Channel, PounderPdhSettings},
+    app_utils::lock::{LockSettings,LockState, LockBox},
     hardware::{
         self,
         adc::{Adc0Input, Adc1Input, AdcCode},
@@ -171,6 +172,9 @@ pub struct Settings {
     /// See [PounderConfig#miniconf]
     #[tree(depth(2))]
     pounder: [PounderPdhSettings; 2],
+
+    #[tree(depth(2))]
+    lockbox: [LockSettings; 2],
 }
 
 impl Default for Settings {
@@ -206,6 +210,11 @@ impl Default for Settings {
                 PounderPdhSettings::new(Channel::ZERO),
                 PounderPdhSettings::new(Channel::ONE),
             ],
+
+            lockbox: [
+                LockSettings::default(),
+                LockSettings::default(),
+            ],
         }
     }
 }
@@ -228,6 +237,7 @@ mod app {
         signal_generator: [SignalGenerator; 2],
         pounder: pounder::PounderDevices,
         dds: pounder::dds_output::DdsOutput,
+        lockbox: [LockBox; 2],
     }
 
     #[local]
@@ -298,6 +308,16 @@ mod app {
             ],
             dds: pounder.dds_output,
             pounder: pounder.pounder,
+            lockbox: [
+                LockBox {
+                    settings: application_settings.lockbox[0],
+                    state: LockState::SCANNING,
+                },
+                LockBox {
+                    settings: application_settings.lockbox[1],
+                    state: LockState::SCANNING,
+                },
+            ],
         };
 
         let mut local = Local {
@@ -352,7 +372,7 @@ mod app {
     ///
     /// Because the ADC and DAC operate at the same rate, these two constraints actually implement
     /// the same time bounds, meeting one also means the other is also met.
-    #[task(binds=DMA1_STR4, local=[digital_inputs, adcs, dacs, iir_state, generator], shared=[settings, signal_generator, telemetry, dds], priority=3)]
+    #[task(binds=DMA1_STR4, local=[digital_inputs, adcs, dacs, iir_state, generator], shared=[settings, signal_generator, telemetry, dds, lockbox], priority=3)]
     #[link_section = ".itcm.process"]
     fn process(c: process::Context) {
         let process::SharedResources {
@@ -360,6 +380,7 @@ mod app {
             telemetry,
             dds: _,
             signal_generator,
+            lockbox,
         } = c.shared;
 
         let process::LocalResources {
@@ -370,14 +391,20 @@ mod app {
             generator,
         } = c.local;
 
-        (settings, telemetry, signal_generator).lock(
-            |settings, telemetry, signal_generator| {
+
+
+                        
+        (settings, telemetry, signal_generator, lockbox).lock(
+            |settings, telemetry, signal_generator, lockbox| {
                 let digital_inputs =
                     [digital_inputs.0.is_high(), digital_inputs.1.is_high()];
                 telemetry.digital_inputs = digital_inputs;
 
                 let hold = settings.force_hold
                     || (digital_inputs[1] && settings.allow_hold);
+
+
+
 
                 (adc0, adc1, dac0, dac1).lock(|adc0, adc1, dac0, dac1| {
                     let adc_samples = [adc0, adc1];
@@ -387,6 +414,7 @@ mod app {
                     fence(Ordering::SeqCst);
 
                     for channel in 0..adc_samples.len() {
+
                         adc_samples[channel]
                             .iter()
                             .zip(dac_samples[channel].iter_mut())
@@ -398,7 +426,8 @@ mod app {
                                     .iter()
                                     .zip(iir_state[channel].iter_mut())
                                     .fold(x, |yi, (ch, state)| {
-                                        let filter = if hold {
+                                        let ch_hold = hold || (match lockbox[channel].state { LockState::SCANNING => true, _ => false} && settings.lockbox[channel].enable);
+                                        let filter = if ch_hold {
                                             &iir::Biquad::HOLD
                                         } else {
                                             ch
@@ -417,6 +446,43 @@ mod app {
                                 *di = DacCode::from(y).0;
                             })
                             .last();
+
+
+                        match settings.lockbox[channel].state_request {
+                            LockState::SCANNING => {
+                                match lockbox[channel].state {
+                                    LockState::SCANNING => {},
+                                    LockState::LOCKED => {
+                                        lockbox[channel].state = LockState::SCANNING;
+                                        signal_generator[channel].hold = false;
+                                        for state in &mut iir_state[channel] {
+                                            *state = [0., 0. , 0., 0.];
+                                            //log::info!("{:?}" , state);
+                                        }
+                                        //log::info!("Ch {} State changed to {:?}", channel, lockbox[channel].state);
+                                    },
+                                }
+                            },
+                            LockState::LOCKED => {
+                                match lockbox[channel].state {
+                                    LockState::SCANNING => {
+                                        if signal_generator[channel].sign(){
+                                            let current_y = dac_samples[channel].last().expect("No DAC sample");
+                                            let lock_y = (settings.lockbox[channel].lock_point * i16::MIN as f32 / -10.) as i16;
+                                            
+                                            if current_y.abs_diff(lock_y as u16 + i16::MIN as u16) <= 10 {
+                                                lockbox[channel].state = LockState::LOCKED;
+                                                signal_generator[channel].hold = true;
+                                                //log::info!("{} {}" , settings.lockbox[channel].lock_point, lock_y as u16);
+                                                //log::info!("Ch {} State changed to {:?} at {:?}", channel, lockbox[channel].state, current_y);
+                                            }
+                                        }
+                                    },
+                                    LockState::LOCKED => {},
+                                }
+                            },
+                        } 
+                        
                     }
 
                     // Stream the data.
