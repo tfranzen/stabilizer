@@ -468,7 +468,7 @@ mod app {
                                     LockState::SCANNING => {
                                         if signal_generator[channel].sign(){
                                             let current_y = dac_samples[channel].last().expect("No DAC sample");
-                                            let lock_y = (settings.lockbox[channel].lock_point * i16::MIN as f32 / -10.) as i16;
+                                            let lock_y = (settings.lockbox[channel].lock_point * i16::MIN as f32 / -10.24) as i16;
                                             
                                             if current_y.abs_diff(lock_y as u16 + i16::MIN as u16) <= 10 {
                                                 lockbox[channel].state = LockState::LOCKED;
