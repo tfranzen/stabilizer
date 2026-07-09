@@ -410,6 +410,7 @@ mod app {
                     let adc_samples = [adc0, adc1];
                     let dac_samples = [dac0, dac1];
 
+
                     // Preserve instruction and data ordering w.r.t. DMA flag access.
                     fence(Ordering::SeqCst);
 
@@ -482,8 +483,16 @@ mod app {
                                 }
                             },
                         } 
-                        
+
+                        if settings.lockbox[channel].blank_return && !signal_generator[channel].sign() {
+                            for i in 0..BATCH_SIZE{
+                                adc_samples[channel][i] = 0_u16;
+                            }
+                        };
+
                     }
+
+                    
 
                     // Stream the data.
                     const N: usize = BATCH_SIZE * core::mem::size_of::<i16>();
